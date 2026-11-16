@@ -50,6 +50,22 @@ def cmd_plan(args):
 
 
 def cmd_run(args):
+    if getattr(args, "view_id", None):
+        # 视图入口：查询绑定视图的固定 F，从本地冻结库读取，不访问实时源
+        from .coordinator import Coordinator
+        from .executor import read_result
+        coord = Coordinator(args.workdir)
+        with open(args.query, encoding="utf-8") as f:
+            qjson = json.load(f)
+        plan, result, stats = coord.run(
+            args.view_id, qjson, args.out, name=args.name or "cli-run")
+        assert read_result(args.out)["complete"]
+        print(f"视图 {args.view_id} 完成: {len(result['rows'])} 行 → {args.out}")
+        if args.print_rows:
+            print(f"列: {result['columns']}")
+            for row in result["rows"]:
+                print(f"  {row}")
+        return
     clients, caps = _clients(args)
     with open(args.query, encoding="utf-8") as f:
         q = Q.from_json(json.load(f))
@@ -77,6 +93,110 @@ def cmd_run(args):
 def cmd_demo(args):
     from .demo import run_demo
     run_demo(args.workdir)
+
+
+# ------------------------------------------------------------ 跨源读取视图
+
+def _load_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def cmd_serve_history(args):
+    """启动一个版本化模拟源（真实提交历史、读取保护、管理接口）。"""
+    from .version_server import serve_version
+    from .versions import history_from_config
+    hist = history_from_config(_load_json(args.history))
+    serve_version(hist, args.log, "127.0.0.1", args.port, args.max_page_bytes)
+
+
+def cmd_view_demo(args):
+    from .demo_views import run
+    run(args.workdir)
+
+
+def cmd_view_open(args):
+    from .coordinator import Coordinator
+    coord = Coordinator(args.workdir)
+    config = _load_json(args.config)
+    res = coord.open(config, note=args.note or "")
+    print(json.dumps(res, ensure_ascii=False, indent=1))
+
+
+def cmd_view_list(args):
+    from .coordinator import Coordinator
+    for v in Coordinator(args.workdir).list_views():
+        print(json.dumps(v, ensure_ascii=False))
+
+
+def cmd_view_show(args):
+    from .coordinator import Coordinator
+    d = Coordinator(args.workdir).describe(args.view_id)
+    print(json.dumps(d, ensure_ascii=False, indent=1))
+
+
+def cmd_view_run(args):
+    from .coordinator import Coordinator
+    from .executor import read_result
+    coord = Coordinator(args.workdir)
+    qjson = _load_json(args.query)
+    plan, result, stats = coord.run(args.view_id, qjson, args.out,
+                                    name=args.name or "cli-query")
+    print(f"完成: {len(result['rows'])} 行 → {args.out}")
+    if args.print_rows:
+        print(f"列: {result['columns']}")
+        for row in result["rows"]:
+            print(f"  {row}")
+    print("源读取统计: " + json.dumps(stats["sources"], ensure_ascii=False))
+
+
+def cmd_view_close(args):
+    from .coordinator import Coordinator
+    print(json.dumps(Coordinator(args.workdir).close(args.view_id),
+                     ensure_ascii=False))
+
+
+def cmd_view_cleanup(args):
+    from .coordinator import Coordinator
+    info = Coordinator(args.workdir).cleanup_failed(args.view_id)
+    print(json.dumps(info, ensure_ascii=False))
+
+
+def cmd_admin(args):
+    """对版本源发管理动作（发布/淘汰/替换/注入失败/查状态）。"""
+    from .coordinator import VersionClient
+    c = VersionClient(args.source, args.url)
+    payload = None
+    if args.head is not None:
+        path, payload = "/admin/publish", {"head": args.head}
+    elif args.earliest is not None:
+        path, payload = "/admin/earliest", {"earliest": args.earliest}
+    elif args.new_instance:
+        path, payload = "/admin/replace-instance", {"instance_id": args.new_instance}
+    elif args.fail_route:
+        path, payload = "/admin/fail", {"route": args.fail_route}
+    else:
+        path = "/admin/state"
+    print(json.dumps(c.admin(path, payload), ensure_ascii=False, indent=1))
+
+
+def cmd_enumcheck(args):
+    from .enumcheck import main as enum_main
+    raise SystemExit(enum_main(["--config", args.config] if args.config else
+                               ["--metadata-dir", args.metadata_dir]))
+
+
+def cmd_gen_scenarios(args):
+    """导出三源历史与协调者配置文件（供分进程 serve-history 与 enumcheck 复做）。"""
+    from . import scenarios as SC
+    histories = SC.ring_histories()
+    urls = {n: f"http://127.0.0.1:{p}" for n, p in
+            zip(("A", "B", "C"), (args.port_a, args.port_b, args.port_c))}
+    path = SC.write_configs(histories, urls, args.out_dir)
+    print("已写出历史配置:")
+    for n in ("A", "B", "C"):
+        print(f"  {args.out_dir}/{n}.json   # {urls[n]}")
+    print(f"协调者配置: {path}")
 
 
 def cmd_queries(args):
@@ -114,6 +234,10 @@ def main(argv=None):
             s.add_argument("--workdir", default="/tmp/fedq-work")
             s.add_argument("--print", dest="print_rows", action="store_true")
             s.add_argument("--show-plan", action="store_true")
+            # 视图入口：给定 view_id 后查询绑定视图固定 F，从冻结库读取
+            s.add_argument("--view-id", default=None,
+                           help="在已打开视图内执行（绑定该视图的 F，本地冻结读取）")
+            s.add_argument("--name", default=None, help="本次查询在视图账本中的名字")
             s.set_defaults(fn=cmd_run)
 
     s = sub.add_parser("demo", help="端到端演示（内嵌启动两个模拟源）")
@@ -123,6 +247,73 @@ def main(argv=None):
     s = sub.add_parser("queries", help="导出演示查询 JSON 文件")
     s.add_argument("--out-dir", required=True)
     s.set_defaults(fn=cmd_queries)
+
+    # ---------------- 跨源读取视图（版本化） ----------------
+    s = sub.add_parser("serve-history", help="启动一个版本化模拟数据源")
+    s.add_argument("--history", required=True, help="单源历史 JSON（gen-scenarios 产出）")
+    s.add_argument("--port", type=int, required=True)
+    s.add_argument("--log", required=True)
+    s.add_argument("--max-page-bytes", type=int, default=8192)
+    s.set_defaults(fn=cmd_serve_history)
+
+    s = sub.add_parser("gen-scenarios", help="导出三源历史与协调者配置")
+    s.add_argument("--out-dir", required=True)
+    s.add_argument("--port-a", type=int, default=8021)
+    s.add_argument("--port-b", type=int, default=8022)
+    s.add_argument("--port-c", type=int, default=8023)
+    s.set_defaults(fn=cmd_gen_scenarios)
+
+    s = sub.add_parser("view-demo", help="跨源读取视图全部验收场景（内嵌三源）")
+    s.add_argument("--workdir", default="/tmp/fedq-views-demo")
+    s.set_defaults(fn=cmd_view_demo)
+
+    s = sub.add_parser("view-open", help="打开依赖闭合的读取视图，返回 view_id")
+    s.add_argument("--config", required=True, help="逻辑源名→HTTP 地址配置 JSON")
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.add_argument("--note", default=None)
+    s.set_defaults(fn=cmd_view_open)
+
+    s = sub.add_parser("view-list", help="列出视图及其状态")
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.set_defaults(fn=cmd_view_list)
+
+    s = sub.add_parser("view-show", help="查看视图：F、退回解释、源身份与 HTTP 读取依据")
+    s.add_argument("--view-id", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.set_defaults(fn=cmd_view_show)
+
+    s = sub.add_parser("view-run", help="在视图内执行查询（绑定同一 F）")
+    s.add_argument("--view-id", required=True)
+    s.add_argument("--query", required=True)
+    s.add_argument("--out", required=True)
+    s.add_argument("--name", default=None)
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.add_argument("--print", dest="print_rows", action="store_true")
+    s.set_defaults(fn=cmd_view_run)
+
+    s = sub.add_parser("view-close", help="关闭视图（拒绝新查询，回收冻结副本）")
+    s.add_argument("--view-id", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.set_defaults(fn=cmd_view_close)
+
+    s = sub.add_parser("view-cleanup", help="清理失败建立遗留的临时保护与副本")
+    s.add_argument("--view-id", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.set_defaults(fn=cmd_view_cleanup)
+
+    s = sub.add_parser("admin", help="版本源管理动作（发布/淘汰/替换/注入/状态）")
+    s.add_argument("--source", required=True)
+    s.add_argument("--url", required=True)
+    s.add_argument("--head", type=int, default=None)
+    s.add_argument("--earliest", type=int, default=None)
+    s.add_argument("--new-instance", default=None)
+    s.add_argument("--fail-route", default=None)
+    s.set_defaults(fn=cmd_admin)
+
+    s = sub.add_parser("enumcheck", help="独立穷举所有候选向量核对最大闭合向量")
+    s.add_argument("--config", default=None)
+    s.add_argument("--metadata-dir", default=None)
+    s.set_defaults(fn=cmd_enumcheck)
 
     args = p.parse_args(argv)
     args.fn(args)
