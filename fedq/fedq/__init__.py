@@ -10,6 +10,10 @@
 - planner     依据能力决定远端提前做什么，剩余语义本地完成；给出每条依据。
 - executor    本地执行（SQLite 落盘 + Python），流式输出，部分流不得标记为完整。
 - reference   独立的纯 Python 关系解释器（小数据、袋语义），用于对照。
+- versions / version_server / viewstore / coordinator
+              跨源读取视图：依赖闭合的版本向量、真实冻结、失败清理。
+- lineage     结果数据血缘：带血缘执行、可展开证据、按源行反查（SQLite 证据库）。
+- lineage_ref 独立小样本血缘参照（自行枚举输入出现并推导，不调用生产血缘代码）。
 """
 
 __version__ = "0.1.0"

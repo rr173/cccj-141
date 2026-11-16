@@ -10,6 +10,10 @@
 执行，直到显式关闭。它回答的是“多个独立 HTTP 源此刻究竟能同时读到哪些版本”，
 而不是再加一种筛选或改写答案。
 
+第三部分新增**结果数据血缘**：在视图上做一次可留存的带血缘执行，从某一条结果
+追到它实际使用的输入出现（row_ref 逐层展开），或拿源行身份反查本次哪些结果
+用到了它；证据自包含，视图关闭后仍可导航。
+
 仅依赖 Python 3.11+ 标准库。
 
 ## 快速复做
@@ -17,8 +21,10 @@
 ```sh
 sh scripts/demo.sh            # 第一部分端到端：内嵌两个源，全部演示查询+失败边界
 sh scripts/demo_views.sh      # 第二部分：三个独立版本源的读取视图全部验收场景
+sh scripts/demo_lineage.sh    # 第三部分：带血缘执行全部验收场景+关视图后新进程导航
 sh scripts/manual_views.sh    # 分进程三源 + 打开/查询/推进/重启/淘汰/关闭全流程
-python3 -m unittest discover -s tests -v   # 50 个测试（31 基础 + 19 视图）
+sh scripts/manual_lineage.sh  # 分进程两源 + 带血缘执行/展开/反查/关闭后导航
+python3 -m unittest discover -s tests -v   # 72 个测试（31 基础 + 19 视图 + 22 血缘）
 ```
 
 第一部分手动流程：
@@ -229,6 +235,33 @@ JSON 节点：`source / filter / project / join(inner|left 等值) / aggregate(�
 
 同一视图内的不同查询可读不同表、选不同列、不同过滤/连接/分页，但全部绑定同一 F；
 结果与源 HTTP 日志可按 `instance_id / at / view_id / snapshot_id / page` 逐项核对。
+
+## 结果数据血缘（第三部分，`fedq/lineage.py`、`lineage_ref.py`、`demo_lineage.py`）
+
+对账看到一笔联查汇总不对时，需要知道它**到底用了哪些原始行**。在已打开视图上做
+一次**带血缘执行**：执行用户提交的查询树本身，把结果与可展开的证据一起落本地，
+之后按 `row_ref` 逐层展开推导、或拿源行身份反查本次哪些结果用到了它。
+这是结果数据的血缘——不是重新解释下推计划，也不是“改一行会怎样”的反事实分析。
+
+- **袋语义**：同值结果不是同一条记录。投影后同值的两行是两个出现、inner 连接的
+  每个匹配对是一个出现，各有 `row_ref`（`run_id:occ_id`，仅保证已完成 run 内稳定）。
+- **源行身份** = 逻辑源 + 实例 + 表 + 读取版本 + 主键 + 查询树输入位置；
+  同一张表出现两次时按位置区分。血缘信息不混作业务列参与过滤/分组/去重。
+- **三类推导**：连接左右依据共同成立（all）；distinct 的多个输入是**备选**推导
+  （any，不是多份业务记录）；聚合把每个输入出现**逐份计入**（agg，边上带
+  counted/null_skipped/sum 精确值）。left 无匹配是 null_fill 标记，不虚构右源行。
+- 证据落 SQLite，子推导按出现共享，**不枚举备选分支的组合**；结果与证据一起完整
+  才标 ok，中途失败留下可识别的 error 目录，不冒充成功；视图关闭、源停止后，
+  另一个进程凭证据库继续导航，不再请求源。
+
+```sh
+sh scripts/demo_lineage.sh      # 端到端验收 + 关视图后新进程 CLI 导航
+sh scripts/manual_lineage.sh    # 分进程两源：打开→带血缘执行→展开→反查→关闭→导航
+python3 -m fedq lineage-run --view-id V --query q.json --workdir W
+python3 -m fedq lineage-rows/expand/lookup/runs/show ...   # 详见 docs/LINEAGE.md
+```
+
+详细模型、存储布局、分页约定与失败目录识别见 `docs/LINEAGE.md`。
 
 ## 已知限制（第一版）
 

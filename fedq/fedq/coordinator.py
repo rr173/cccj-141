@@ -362,6 +362,48 @@ class Coordinator:
             for fc in frozen_clients:
                 fc.close()
 
+    # ------------------------------------------------ 带血缘执行
+    def lineage_run(self, view_id, qjson, name="lineage", fail_hook=None):
+        """在视图冻结数据上做一次**带血缘执行**（结果数据血缘，非下推计划解释）。
+
+        返回 {"run_id", "state", "columns", "rows_out", ...}；失败抛 LineageError
+        （携带 run_id，目录已标记 error）。之后的读取结果/展开/反查走
+        LineageService（同一 workdir），不依赖视图是否仍打开。
+        """
+        from .lineage import LineageService
+        ledger = f"lineage:{name}"
+        self.store.begin_query(view_id, ledger)
+        finished = False
+        try:
+            self.store.get_open_view(view_id)
+            srcs = self.store.view_sources(view_id)
+            frozen_path = self.store.frozen_db_path(view_id)
+            if not os.path.exists(frozen_path):
+                raise ViewError(f"视图 {view_id} 的冻结库缺失（可能已关闭）")
+            service = LineageService(self.workdir)
+            try:
+                info = service.start_run(view_id, qjson, srcs, frozen_path,
+                                         name=name, fail_hook=fail_hook)
+            except Exception as e:
+                self.store.end_query(view_id, ledger, "error", None, 0, str(e))
+                finished = True
+                raise
+            self.store.end_query(view_id, ledger, "ok", info["columns"],
+                                 info["rows_out"],
+                                 json.dumps({"run_id": info["run_id"],
+                                             "results_sha256":
+                                             info["results_sha256"]},
+                                            ensure_ascii=False))
+            finished = True
+            return info
+        finally:
+            if not finished:
+                try:
+                    self.store.end_query(view_id, ledger, "error", None, 0,
+                                         "interrupted")
+                except Exception:
+                    pass
+
     # ------------------------------------------------ 关闭 / 清理
     def close(self, view_id):
         return self.store.close(view_id)

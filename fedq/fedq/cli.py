@@ -211,6 +211,89 @@ def cmd_queries(args):
         print(f"{path}\n    # {note}")
 
 
+# ------------------------------------------------------------ 结果数据血缘
+
+def _lineage_service(args):
+    from .lineage import LineageService
+    return LineageService(args.workdir)
+
+
+def cmd_lineage_run(args):
+    """开始一次带血缘执行（需要仍打开的视图）。"""
+    from .coordinator import Coordinator
+    from .lineage import LineageError
+    coord = Coordinator(args.workdir)
+    qjson = _load_json(args.query)
+    try:
+        info = coord.lineage_run(args.view_id, qjson,
+                                 name=args.name or "cli-lineage")
+    except LineageError as e:
+        print(f"带血缘执行失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(info, ensure_ascii=False, indent=1))
+    first = _lineage_service(args).rows(info["run_id"], 0, args.page_size)
+    print(f"结果第 0 页（共 {first['total']} 行，列 {first['columns']}）:")
+    for it in first["items"]:
+        print(f"  {it['row_ref']}  {json.dumps(it['values'], ensure_ascii=False)}")
+
+
+def cmd_lineage_runs(args):
+    for r in _lineage_service(args).list_runs():
+        print(json.dumps(r, ensure_ascii=False))
+
+
+def cmd_lineage_show(args):
+    print(json.dumps(_lineage_service(args).show(args.run_id),
+                     ensure_ascii=False, indent=1))
+
+
+def cmd_lineage_rows(args):
+    r = _lineage_service(args).rows(args.run_id, args.page, args.page_size)
+    print(json.dumps(r, ensure_ascii=False, indent=1))
+
+
+def cmd_lineage_expand(args):
+    r = _lineage_service(args).expand(args.row_ref, args.page, args.page_size)
+    print(json.dumps(r, ensure_ascii=False, indent=1))
+
+
+def cmd_lineage_lookup(args):
+    try:
+        pk = json.loads(args.pk)
+    except json.JSONDecodeError:
+        pk = args.pk
+    if not isinstance(pk, list):
+        pk = [pk]
+    r = _lineage_service(args).lookup(
+        args.run_id, args.source, args.table, pk, path=args.path,
+        instance_id=args.instance_id, at=args.at,
+        page=args.page, page_size=args.page_size)
+    print(json.dumps(r, ensure_ascii=False, indent=1))
+
+
+def cmd_lineage_demo(args):
+    from .demo_lineage import run
+    run(args.workdir)
+
+
+def cmd_lineage_fixtures(args):
+    """导出血缘演示夹具（两源历史 + 查询 + 协调者配置），供分进程复做。"""
+    import os
+    from . import scenarios as SC
+    from .demo_lineage import fixture_histories, lineage_queries
+    os.makedirs(args.out_dir, exist_ok=True)
+    hists = fixture_histories(args.scale_rows)
+    urls = {"A": f"http://127.0.0.1:{args.port_a}",
+            "B": f"http://127.0.0.1:{args.port_b}"}
+    SC.write_configs(hists, urls, args.out_dir)
+    for name, qjson, note in lineage_queries():
+        with open(os.path.join(args.out_dir, f"q_{name}.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(qjson, f, ensure_ascii=False, indent=1)
+    print(f"已写出夹具: {args.out_dir}/A.json B.json coordinator.json "
+          f"q_*.json（scale 行数 {args.scale_rows}）")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="fedq", description="联邦查询执行器")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -314,6 +397,67 @@ def main(argv=None):
     s.add_argument("--config", default=None)
     s.add_argument("--metadata-dir", default=None)
     s.set_defaults(fn=cmd_enumcheck)
+
+    # ---------------- 结果数据血缘（第三部分） ----------------
+    s = sub.add_parser("lineage-run",
+                       help="开始一次带血缘执行（视图内），返回 run_id 与 row_ref")
+    s.add_argument("--view-id", required=True)
+    s.add_argument("--query", required=True)
+    s.add_argument("--name", default=None)
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.add_argument("--page-size", type=int, default=20)
+    s.set_defaults(fn=cmd_lineage_run)
+
+    s = sub.add_parser("lineage-runs", help="列出全部血缘 run 及其状态")
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.set_defaults(fn=cmd_lineage_runs)
+
+    s = sub.add_parser("lineage-show",
+                       help="查看 run 元数据（查询/源坐标/状态）并核对结果校验和")
+    s.add_argument("--run-id", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.set_defaults(fn=cmd_lineage_show)
+
+    s = sub.add_parser("lineage-rows", help="分页读取 run 结果（每项带 row_ref）")
+    s.add_argument("--run-id", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.add_argument("--page", type=int, default=0)
+    s.add_argument("--page-size", type=int, default=20)
+    s.set_defaults(fn=cmd_lineage_rows)
+
+    s = sub.add_parser("lineage-expand", help="按 row_ref 逐层展开推导（备选/成员分页）")
+    s.add_argument("--row-ref", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.add_argument("--page", type=int, default=0)
+    s.add_argument("--page-size", type=int, default=20)
+    s.set_defaults(fn=cmd_lineage_expand)
+
+    s = sub.add_parser("lineage-lookup",
+                       help="按源行身份反查本次哪些最终结果用到了它")
+    s.add_argument("--run-id", required=True)
+    s.add_argument("--source", required=True)
+    s.add_argument("--table", required=True)
+    s.add_argument("--pk", required=True,
+                   help="主键值（单个值或 JSON 数组，如 3 或 '[3]')")
+    s.add_argument("--path", default=None,
+                   help="可选：限定查询树输入位置（同表两次引用时区分）")
+    s.add_argument("--instance-id", default=None)
+    s.add_argument("--at", type=int, default=None)
+    s.add_argument("--workdir", default="/tmp/fedq-views")
+    s.add_argument("--page", type=int, default=0)
+    s.add_argument("--page-size", type=int, default=20)
+    s.set_defaults(fn=cmd_lineage_lookup)
+
+    s = sub.add_parser("lineage-demo", help="结果数据血缘全部验收场景（内嵌两源）")
+    s.add_argument("--workdir", default="/tmp/fedq-lineage-demo")
+    s.set_defaults(fn=cmd_lineage_demo)
+
+    s = sub.add_parser("lineage-fixtures", help="导出血缘演示夹具（供分进程复做）")
+    s.add_argument("--out-dir", required=True)
+    s.add_argument("--scale-rows", type=int, default=2500)
+    s.add_argument("--port-a", type=int, default=8031)
+    s.add_argument("--port-b", type=int, default=8032)
+    s.set_defaults(fn=cmd_lineage_fixtures)
 
     args = p.parse_args(argv)
     args.fn(args)
