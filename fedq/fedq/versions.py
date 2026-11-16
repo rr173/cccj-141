@@ -112,12 +112,19 @@ class SourceHistory:
                 if t not in self.schemas:
                     raise HistoryError(f"源 {self.name} 提交 {c.seq}: 未知表 {t}")
                 cols = self.schemas[t]["columns"]
+                keycols = self.schemas[t].get("key", ["id"])
                 for r in ch.upserts:
                     _check_row(self.name, t, cols, r)
                 for rid in ch.deletes:
-                    if not isinstance(rid, int) or isinstance(rid, bool) or rid < 0:
-                        raise HistoryError(
-                            f"源 {self.name} 提交 {c.seq} 表 {t}: 删除 id 必须是非负整数")
+                    # 单列整数主键可直接写标量；其余（text 键、复合键）用列表
+                    if len(keycols) == 1 and cols[keycols[0]] == "int":
+                        if not isinstance(rid, int) or isinstance(rid, bool) \
+                                or rid < 0:
+                            raise HistoryError(
+                                f"源 {self.name} 提交 {c.seq} 表 {t}: "
+                                "删除 id 必须是非负整数")
+                    else:
+                        _check_key(self.name, t, self.schemas[t], rid)
         if seqs != list(range(1, len(seqs) + 1)):
             raise HistoryError(f"源 {self.name}: 提交号必须从 1 连续递增，得到 {seqs}")
         if not isinstance(self.head, int) or isinstance(self.head, bool) \
@@ -150,7 +157,10 @@ class SourceHistory:
                 for row in ch.upserts:                 # 同行 id 更新：后者覆盖前者
                     tbl[_key_of(self.schemas[t], row)] = list(row)
                 for rid in ch.deletes:
-                    tbl.pop(tuple([rid] if len(keycols) == 1 else rid), None)
+                    if isinstance(rid, list):
+                        tbl.pop(tuple(rid), None)
+                    else:
+                        tbl.pop(tuple([rid] if len(keycols) == 1 else rid), None)
         self._states[at] = tables
         return tables
 
@@ -215,6 +225,34 @@ def _key_of(schema, row):
     if len(keycols) == 1:
         return (row[cols.index(keycols[0])],)
     return tuple(row[cols.index(k)] for k in keycols)
+
+
+def _check_key(source, table, schema, key):
+    """校验删除键：单列主键可给标量（int/text/bool），复合键必须给等长列表。"""
+    keycols = schema.get("key", ["id"])
+    cols = schema["columns"]
+    if len(keycols) == 1 and not isinstance(key, list):
+        pairs = [(keycols[0], key)]
+    else:
+        if not isinstance(key, list) or len(key) != len(keycols):
+            raise HistoryError(
+                f"源 {source} 表 {table}: 复合删除键必须是含 {len(keycols)} "
+                f"个主键值的列表，得到 {key!r}")
+        pairs = list(zip(keycols, key))
+    for kcol, v in pairs:
+        ty = cols[kcol]
+        if v is None:
+            raise HistoryError(f"源 {source} 表 {table}: 删除键 {kcol} 不能为 null")
+        if ty == "int":
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise HistoryError(
+                    f"源 {source} 表 {table}: 整数主键 {kcol} 收到 {type(v).__name__}")
+        elif ty == "text" and not isinstance(v, str):
+            raise HistoryError(
+                f"源 {source} 表 {table}: text 主键 {kcol} 收到 {type(v).__name__}")
+        elif ty == "bool" and not isinstance(v, bool):
+            raise HistoryError(
+                f"源 {source} 表 {table}: bool 主键 {kcol} 收到 {type(v).__name__}")
 
 
 def _check_row(source, table, columns, row):
@@ -282,9 +320,19 @@ def validate_metadata(meta, known_sources):
         for t, ch in c.get("changes", {}).items():
             if t not in tables:
                 raise HistoryError(f"源 {name} 提交 {seq}: 改动未知表 {t}")
-            cols = tables[t]["columns"]
+            sch = tables[t]
+            cols = sch["columns"]
+            keycols = sch.get("key", ["id"])
             for r in ch.get("upsert", []):
                 _check_row(name, t, cols, r)
+            for rid in ch.get("delete", []):
+                if len(keycols) == 1 and cols[keycols[0]] == "int":
+                    if not isinstance(rid, int) or isinstance(rid, bool) \
+                            or rid < 0:
+                        raise HistoryError(
+                            f"源 {name} 提交 {seq} 表 {t}: 删除 id 必须是非负整数")
+                else:
+                    _check_key(name, t, sch, rid)
     if seqs != list(range(1, head + 1)):
         raise HistoryError(f"源 {name}: 元数据提交号必须为 1..head 的连续序列，得到 {seqs}")
 

@@ -14,6 +14,12 @@
 追到它实际使用的输入出现（row_ref 逐层展开），或拿源行身份反查本次哪些结果
 用到了它；证据自包含，视图关闭后仍可导航。
 
+第四部分新增**持续查询订阅**：对一个已有版本化 HTTP 源登记一次查询，先在明确
+位置得到初始结果，随后按源的每笔提交**增量维护会变化的关系结果**（只重算受影响
+连接键/分组，不全量重扫），并可逐笔分页取走结果的净增删量更新下游报表；支持
+scan/过滤/投影/inner|left 等值连接/distinct 与最外层 count/sum 聚合，结果是带重数
+的袋，sort/limit 登记时即拒。详见 `docs/SUBSCRIPTIONS.md`。
+
 仅依赖 Python 3.11+ 标准库。
 
 ## 快速复做
@@ -22,9 +28,11 @@
 sh scripts/demo.sh            # 第一部分端到端：内嵌两个源，全部演示查询+失败边界
 sh scripts/demo_views.sh      # 第二部分：三个独立版本源的读取视图全部验收场景
 sh scripts/demo_lineage.sh    # 第三部分：带血缘执行全部验收场景+关视图后新进程导航
+sh scripts/demo_sub.sh        # 第四部分：持续查询订阅全部验收场景（含真终止/断档/换脸/规模诊断）
 sh scripts/manual_views.sh    # 分进程三源 + 打开/查询/推进/重启/淘汰/关闭全流程
 sh scripts/manual_lineage.sh  # 分进程两源 + 带血缘执行/展开/反查/关闭后导航
-python3 -m unittest discover -s tests -v   # 72 个测试（31 基础 + 19 视图 + 22 血缘）
+sh scripts/manual_sub.sh      # 分进程单源 + 登记/逐笔推进/分页净变化/诊断/停止
+python3 -m unittest discover -s tests -v   # 92 个测试（31 基础 + 19 视图 + 22 血缘 + 20 订阅）
 ```
 
 第一部分手动流程：
@@ -262,6 +270,40 @@ python3 -m fedq lineage-rows/expand/lookup/runs/show ...   # 详见 docs/LINEAGE
 ```
 
 详细模型、存储布局、分页约定与失败目录识别见 `docs/LINEAGE.md`。
+
+## 持续查询订阅（第四部分，`fedq/subscription.py`、`sub_service.py`、`sub_oracle.py`）
+
+运营反复汇总同一查询时，不必每次重跑。订阅对**一个**版本化源登记一次查询：
+
+- 在明确位置 `p` 读一次真实快照建立初始结果，之后只走版本源新增的 `/changes/*`
+  按位置取完整提交（真实 upsert/delete + 提交号，可分页但同一提交跨页仍是一个
+  可见状态）；初始化后不再请求完整源表、不重下全部历史。
+- 增量状态全部落订阅私有 SQLite：源主键行、连接键索引、distinct 支持计数、
+  聚合分组成员索引与当前结果袋。一笔提交在**一个事务**里完成传播、结果更新、
+  变更台账与位置推进；进程被真终止后只有“旧位置+旧结果”或“新位置+完整新变更”。
+- 结果是**袋**（业务行 + 重数）；对外可读取当前完整结果，或从某提交之后按
+  `(after_seq,after_id)` 稳定游标分页取净增删量，每个提交（含无变化提交）都有
+  完成边界，本地保留到显式停止，无需确认或远端写。
+- 关键撤回语义：left 右侧最后匹配删除时撤回匹配并补回 null 扩展行；distinct
+  仍有其他输入支持时不撤回值；聚合区分“和恰好为 0 / 全 null / 组已消失”，
+  全局空集保留单行。同笔两边都变、键迁移、自连接都只交付整笔净差。
+- 失败：断页 HTTP 可重试、没取全不推进；历史断档或源 instance_id 变更进入
+  `needs_rebuild`，保留最后完整结果并给重建提示，不跳最新、不混接新源；
+  停止后拒绝推进且不影响别的订阅，新进程可凭原 sub_id 继续。
+- 独立核对器 `sub_oracle.py` 从完整表重算预期袋与差分（不调用增量代码），
+  规模数据运行时生成、仓库只留小夹具，访问诊断可核对只触达受影响键。
+
+```sh
+sh scripts/demo_sub.sh                      # 端到端全部验收（含真实终止/断页/断档/换脸/规模）
+sh scripts/manual_sub.sh                   # 分进程真实 HTTP + CLI 全流程
+python3 -m fedq sub-demo --workdir W --scale-keys 2000
+python3 -m fedq sub-register --config c.json --query q.json --workdir W
+python3 -m fedq sub-advance --sub-id S --to 3 --workdir W
+python3 -m fedq sub-changes --sub-id S --after-seq 2 --workdir W
+python3 -m fedq sub-result/sub-status/sub-diag/sub-stop/sub-rebuild-hint ...
+```
+
+协议、状态机、增量策略、存储布局与失败语义见 `docs/SUBSCRIPTIONS.md`。
 
 ## 已知限制（第一版）
 

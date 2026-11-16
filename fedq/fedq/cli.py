@@ -294,6 +294,86 @@ def cmd_lineage_fixtures(args):
           f"q_*.json（scale 行数 {args.scale_rows}）")
 
 
+# ------------------------------------------------------------ 持续查询订阅（第四部分）
+
+def _sub_service(args):
+    from .sub_service import SubscriptionService
+    return SubscriptionService(args.workdir)
+
+
+def cmd_sub_demo(args):
+    from .demo_sub import run
+    run(args.workdir, scale_keys=args.scale_keys)
+
+
+def cmd_sub_register(args):
+    from .sub_service import SubscriptionError
+    try:
+        res = _sub_service(args).register(
+            _load_json(args.config), _load_json(args.query),
+            note=args.note or "")
+    except SubscriptionError as e:
+        print(f"登记被拒绝: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(res, ensure_ascii=False, indent=1))
+
+
+def cmd_sub_advance(args):
+    print(json.dumps(_sub_service(args).advance(args.sub_id, args.to),
+                     ensure_ascii=False, indent=1))
+
+
+def cmd_sub_result(args):
+    print(json.dumps(_sub_service(args).read_result(args.sub_id),
+                     ensure_ascii=False, indent=1))
+
+
+def cmd_sub_changes(args):
+    print(json.dumps(_sub_service(args).read_changes(
+        args.sub_id, args.after_seq, args.after_id, args.page_size),
+        ensure_ascii=False, indent=1))
+
+
+def cmd_sub_status(args):
+    if args.sub_id:
+        print(json.dumps(_sub_service(args).status(args.sub_id),
+                         ensure_ascii=False, indent=1))
+    else:
+        for r in _sub_service(args).list_subscriptions():
+            print(json.dumps(r, ensure_ascii=False))
+
+
+def cmd_sub_stop(args):
+    print(json.dumps(_sub_service(args).stop(args.sub_id), ensure_ascii=False))
+
+
+def cmd_sub_rebuild_hint(args):
+    print(json.dumps(_sub_service(args).rebuild_hint(args.sub_id),
+                     ensure_ascii=False, indent=1))
+
+
+def cmd_sub_diag(args):
+    print(json.dumps(_sub_service(args).diagnostics(args.sub_id),
+                     ensure_ascii=False, indent=1))
+
+
+def cmd_sub_recover(args):
+    print(json.dumps(_sub_service(args).recover_building(),
+                     ensure_ascii=False, indent=1))
+
+
+def cmd_sub_fixtures(args):
+    """导出订阅演示小夹具（单源历史 + 协调配置 + 查询 JSON），供分进程复做。"""
+    from . import sub_scenarios as SC
+    from .versions import history_from_config
+    # 默认只开放第 0 版初始表，配合手动脚本逐笔 admin/publish 演示增量
+    hist = history_from_config(_load_json(args.history)) if args.history \
+        else SC.subscription_history(head=0)
+    url = f"http://127.0.0.1:{args.port}"
+    hpath, cpath, qdir = SC.write_fixture_config(hist, url, args.out_dir)
+    print(f"历史: {hpath}\n配置: {cpath}\n查询: {qdir}/")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="fedq", description="联邦查询执行器")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -458,6 +538,69 @@ def main(argv=None):
     s.add_argument("--port-a", type=int, default=8031)
     s.add_argument("--port-b", type=int, default=8032)
     s.set_defaults(fn=cmd_lineage_fixtures)
+
+    # ---------------- 持续查询订阅（第四部分） ----------------
+    s = sub.add_parser("sub-demo", help="持续查询订阅全部验收场景（内嵌单版本源）")
+    s.add_argument("--workdir", default="/tmp/fedq-sub-demo")
+    s.add_argument("--scale-keys", type=int, default=2000)
+    s.set_defaults(fn=cmd_sub_demo)
+
+    s = sub.add_parser("sub-register", help="登记持续查询订阅（单版本源，初始化位置=head）")
+    s.add_argument("--config", required=True, help="单源 {sources:{名:{url}}} 配置")
+    s.add_argument("--query", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-subs")
+    s.add_argument("--note", default=None)
+    s.set_defaults(fn=cmd_sub_register)
+
+    s = sub.add_parser("sub-advance", help="推进到指定已开放提交号（缺省到源 head）")
+    s.add_argument("--sub-id", required=True)
+    s.add_argument("--to", type=int, default=None)
+    s.add_argument("--workdir", default="/tmp/fedq-subs")
+    s.set_defaults(fn=cmd_sub_advance)
+
+    s = sub.add_parser("sub-result", help="读取当前完整结果（业务行 + 袋重数）")
+    s.add_argument("--sub-id", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-subs")
+    s.set_defaults(fn=cmd_sub_result)
+
+    s = sub.add_parser("sub-changes", help="从某提交之后分页读取净增删量与完成边界")
+    s.add_argument("--sub-id", required=True)
+    s.add_argument("--after-seq", type=int, required=True)
+    s.add_argument("--after-id", type=int, default=None,
+                   help="页内稳定位置（上一页 next_cursor.after_id）")
+    s.add_argument("--page-size", type=int, default=100)
+    s.add_argument("--workdir", default="/tmp/fedq-subs")
+    s.set_defaults(fn=cmd_sub_changes)
+
+    s = sub.add_parser("sub-status", help="查看订阅状态（不带 --sub-id 则列全部）")
+    s.add_argument("--sub-id", default=None)
+    s.add_argument("--workdir", default="/tmp/fedq-subs")
+    s.set_defaults(fn=cmd_sub_status)
+
+    s = sub.add_parser("sub-stop", help="停止订阅：拒绝推进，保留结果与变更，不影响他者")
+    s.add_argument("--sub-id", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-subs")
+    s.set_defaults(fn=cmd_sub_stop)
+
+    s = sub.add_parser("sub-rebuild-hint", help="needs_rebuild 的重建提示与最后结果摘要")
+    s.add_argument("--sub-id", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-subs")
+    s.set_defaults(fn=cmd_sub_rebuild_hint)
+
+    s = sub.add_parser("sub-diag", help="查看增量访问诊断（触达键/重算分组/读写行数）")
+    s.add_argument("--sub-id", required=True)
+    s.add_argument("--workdir", default="/tmp/fedq-subs")
+    s.set_defaults(fn=cmd_sub_diag)
+
+    s = sub.add_parser("sub-recover", help="重启后回收 building 占位（事务性重做初始化）")
+    s.add_argument("--workdir", default="/tmp/fedq-subs")
+    s.set_defaults(fn=cmd_sub_recover)
+
+    s = sub.add_parser("sub-fixtures", help="导出订阅小夹具（单源历史+配置+查询）")
+    s.add_argument("--out-dir", required=True)
+    s.add_argument("--history", default=None, help="可选：自定义单源历史 JSON")
+    s.add_argument("--port", type=int, default=8041)
+    s.set_defaults(fn=cmd_sub_fixtures)
 
     args = p.parse_args(argv)
     args.fn(args)

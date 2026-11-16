@@ -8,6 +8,13 @@
         按页返回版本 k 的真实表行；
 - POST /snapshot/release {"snapshot_id"}
         释放该保护（引用计数；多个视图/快照钉住同一版本时互不影响）。
+- POST /changes/open  {"after": k, "subscription_id": ...}
+        打开变更会话：覆盖 k+1..head 的完整提交（upsert/delete + 提交号），
+        按提交分页；after 已淘汰（历史断档）→ 409。
+- POST /changes/page  {"change_id", "page"}
+        取一页变更；同一提交可跨页，commit_complete 标明该提交何时读完，
+        订阅者不会把跨页的一笔提交当成多个可见状态。
+- POST /changes/release {"change_id"} 释放变更会话。
 
 管理接口（仅用于可复做演示，不参与查询协议）：
 - POST /admin/publish   {"head": n}        向前推进开放前缀；
@@ -40,6 +47,7 @@ class VersionSource:
         self.max_page_bytes = max_page_bytes
         self.lock = threading.RLock()
         self.snapshots = {}          # snapshot_id -> {"at", "view_id", "tables", "pages":{..}}
+        self.change_sessions = {}    # change_id -> {"after", "subscription_id", "pages"}
         self.fail_next = None        # 注入：下一次某路由失败
         self.request_log = []        # 进程内留一份，方便演示脚本核对
 
@@ -122,6 +130,126 @@ class VersionSource:
                       "instance_id": self.hist.instance_id})
             return True
 
+    # ---- 按位置取完整提交（持续查询订阅的变更入口）----
+    def open_changes(self, after, subscription_id):
+        """打开一个变更读取会话：覆盖 after+1..head 的完整提交，按提交分页。
+
+        每笔提交是不可分割的可见状态：一页只属于一笔提交，响应显式带
+        commit_complete；同一提交跨多页时订阅者不会把它当成几个状态。
+        after < earliest（历史断档）或 after > head → HistoryError（HTTP 409）。
+        """
+        with self.lock:
+            if self.fail_next == "changes/open":
+                self.fail_next = None
+                raise RuntimeError("injected failure on changes/open")
+            if not isinstance(after, int) or isinstance(after, bool):
+                raise HistoryError("after 必须是整数（bool 不允许）")
+            if after < 0 or after > self.hist.head:
+                raise HistoryError(
+                    f"变更起点 after={after} 越界（head={self.hist.head}）")
+            if after < self.hist.earliest:
+                raise HistoryError(
+                    f"变更起点 after={after} 已淘汰：当前 earliest="
+                    f"{self.hist.earliest}，无法提供 {after + 1} 的完整提交（历史断档）")
+            pages = []
+            for commit in self.hist.commits[after: self.hist.head]:
+                # 每页只承载一笔提交；过大的提交按表/行再切成多页，但仍带同一 seq
+                for chunk in self._paginate_commit(commit):
+                    pages.append({"seq": commit.seq,
+                                  "requires": dict(commit.requires),
+                                  "note": commit.note,
+                                  "changes": chunk})
+            change_id = uuid.uuid4().hex
+            self.change_sessions[change_id] = {
+                "after": after, "subscription_id": subscription_id, "pages": pages}
+            self.log({"route": "changes/open", "change_id": change_id,
+                      "subscription_id": subscription_id, "after": after,
+                      "head": self.hist.head, "pages": len(pages),
+                      "instance_id": self.hist.instance_id})
+            return {"change_id": change_id, "after": after,
+                    "head": self.hist.head,
+                    "instance_id": self.hist.instance_id, "pages": len(pages)}
+
+    def change_page(self, change_id, page):
+        with self.lock:
+            if self.fail_next == "/changes/page":
+                self.fail_next = None
+                raise RuntimeError("injected failure on changes/page")
+            sess = self.change_sessions.get(change_id)
+            if sess is None:
+                raise KeyError(f"未知变更会话 {change_id}（实例可能已被替换）")
+            pages = sess["pages"]
+            if not isinstance(page, int) or isinstance(page, bool) \
+                    or not (0 <= page < len(pages)):
+                raise IndexError(f"页码 {page} 越界 0..{len(pages) - 1}")
+            item = pages[page]
+            nxt = page + 1 if page + 1 < len(pages) else None
+            # 同一提交可能跨页：下一页仍属同一 seq 时 commit_complete=False
+            commit_complete = (nxt is None or pages[nxt]["seq"] != item["seq"])
+            self.log({"route": "changes/page", "change_id": change_id,
+                      "subscription_id": sess["subscription_id"],
+                      "instance_id": self.hist.instance_id,
+                      "page": page, "seq": item["seq"],
+                      "tables": sorted(item["changes"]),
+                      "commit_complete": commit_complete})
+            return {"change_id": change_id, "page": page,
+                    "next_page": nxt, "seq": item["seq"],
+                    "head": self.hist.head,
+                    "instance_id": self.hist.instance_id,
+                    "requires": item["requires"], "note": item["note"],
+                    "changes": item["changes"],
+                    "commit_complete": commit_complete,
+                    "session_complete": nxt is None}
+
+    def release_changes(self, change_id):
+        with self.lock:
+            sess = self.change_sessions.pop(change_id, None)
+            if sess is None:
+                return False
+            self.log({"route": "changes/release", "change_id": change_id,
+                      "subscription_id": sess["subscription_id"],
+                      "instance_id": self.hist.instance_id})
+            return True
+
+    def _paginate_commit(self, commit):
+        """把一笔提交切成一页或多页；每页是 {table: {"upsert":[..], "delete":[..]}}。
+
+        按行预算切分（与快照分页同一口径）：单页超预算就另开一页，新页重复表名。
+        切分只在页边界发生，不改变行内容；同一 seq 的多页由 change_page 的
+        commit_complete 标记区分，订阅者必须收齐同一 seq 的全部页才可见该提交。
+        """
+        budget = self.max_page_bytes
+        pages = []
+        cur, size = {}, 2
+
+        def flush():
+            nonlocal cur, size
+            if cur:
+                pages.append(cur)
+            cur, size = {}, 2
+
+        for t, ch in commit.changes.items():
+            part = cur.setdefault(t, {"upsert": [], "delete": []})
+            for row in ch.upserts:
+                n = len(json.dumps(row, ensure_ascii=False)) + 2
+                if cur and size + n > budget:
+                    flush()
+                    part = cur.setdefault(t, {"upsert": [], "delete": []})
+                part["upsert"].append(list(row))
+                size += n
+            for rid in ch.deletes:
+                n = len(json.dumps(rid, ensure_ascii=False)) + 2
+                if cur and size + n > budget:
+                    flush()
+                    part = cur.setdefault(t, {"upsert": [], "delete": []})
+                part["delete"].append(rid)
+                size += n
+        if not cur:
+            t0 = next(iter(commit.changes))
+            cur = {t0: {"upsert": [], "delete": []}}
+        flush()
+        return pages
+
     def _paginate(self, cols, rows):
         budget = self.max_page_bytes
         pages, cur, size = [], [], 2
@@ -162,6 +290,8 @@ class VersionSource:
             old = self.hist.instance_id
             dropped = list(self.snapshots)
             self.snapshots.clear()
+            dropped_changes = list(self.change_sessions)
+            self.change_sessions.clear()
             self.hist._protections.clear()
             self.hist.instance_id = new_instance_id
             if head is not None:
@@ -169,7 +299,8 @@ class VersionSource:
             if earliest is not None:
                 self.hist.advance_earliest(earliest)
             self.log({"route": "admin/replace-instance", "from": old,
-                      "to": new_instance_id, "dropped_snapshots": len(dropped)})
+                      "to": new_instance_id, "dropped_snapshots": len(dropped),
+                      "dropped_change_sessions": len(dropped_changes)})
             return old, new_instance_id
 
     def admin_state(self):
@@ -180,6 +311,10 @@ class VersionSource:
                     "protected": dict(self.hist._protections),
                     "snapshots": {sid: {"at": s["at"], "view_id": s["view_id"]}
                                   for sid, s in self.snapshots.items()},
+                    "change_sessions": {
+                        cid: {"after": s["after"],
+                              "subscription_id": s["subscription_id"]}
+                        for cid, s in self.change_sessions.items()},
                     "commits_total": len(self.hist.commits)}
 
 
@@ -226,6 +361,17 @@ def make_version_handler(src: VersionSource):
                         body["snapshot_id"], body["table"], body["page"]))
                 elif route == "/snapshot/release":
                     ok = src.release(body["snapshot_id"])
+                    _json_response(self, 200 if ok else 409,
+                                   {"released": ok})
+                elif route == "/changes/open":
+                    info = src.open_changes(body["after"],
+                                            body.get("subscription_id", "anon"))
+                    _json_response(self, 200, info)
+                elif route == "/changes/page":
+                    _json_response(self, 200, src.change_page(
+                        body["change_id"], body["page"]))
+                elif route == "/changes/release":
+                    ok = src.release_changes(body["change_id"])
                     _json_response(self, 200 if ok else 409,
                                    {"released": ok})
                 elif route == "/admin/publish":

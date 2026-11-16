@@ -104,6 +104,19 @@ class VersionClient:
         return self._post("/snapshot/release", {"snapshot_id": snapshot_id},
                           retry=False)
 
+    # ---- 持续查询订阅的按位置变更入口 ----
+    def changes_open(self, after, subscription_id):
+        return self._post("/changes/open",
+                          {"after": after, "subscription_id": subscription_id})
+
+    def changes_page(self, change_id, page):
+        return self._post("/changes/page",
+                          {"change_id": change_id, "page": page})
+
+    def changes_release(self, change_id):
+        return self._post("/changes/release", {"change_id": change_id},
+                          retry=False)
+
     # 管理接口（演示用）
     def admin(self, path, payload=None):
         if path.startswith("/admin/state"):
